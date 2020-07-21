@@ -1,0 +1,239 @@
+#-----------------------------
+#---------- READ ME ----------
+#-----------------------------
+
+# This is a Python 3 code for a 3D direct N-body simulation of two colliding parallel galaxies.
+# Each galaxy's structure is formed by letting an initial cylindrical-like structure evolve.
+# The initial structure is made of an outer cylinder, and an inner cylinder ("core") with a higher density. These have uniform densities.
+# The bodies are placed randomly to form those structures.
+# The bodies have radii.
+# Once two bodies "touch" each other they won't interact at that time.
+#   ^ This simulates them passing by each other, having the gravitational force neutralised.
+#   ^ Without it the numerical error caused by reaching high acceleration would be significant, not preserving energy well enough.
+
+# Three procedures are performed:
+# 1. Initialising position and velocity vectors of all bodies.
+# 2. Running, creating a time series. It has all positions in all frames.
+# 3. Displaying the time series, or saving it.
+#    One can display a saved time series.
+
+# Only NumPy and Matplotlib are required.
+
+# Further explanations are given in the code.
+
+# Written by Alon Granek, 2020.
+
+# ---------------------------------------------
+
+import numpy as np
+from numpy import mgrid
+import matplotlib.pyplot as mplot
+import matplotlib.animation as anim
+from mpl_toolkits.mplot3d import Axes3D
+import random
+
+
+#-------------------------------
+#---------- VARIABLES ----------
+#-------------------------------
+
+#### General scalar constants ####
+N = 4000                    # Total body count.
+Gm = 5*(10**8)              # Gravitational parameter G*m of each body.
+dt = 0.001                  # Timestep.
+Diam = 70                   # Body diameter.
+LenUnit = 2000              # Length unit.
+
+#### Related to running ####
+dtCount = 1000                # Frame count.
+TimeSeries = np.zeros([3,N,dtCount])    # Position time series. [x/y/z, body index, frame index]
+AccTimeSeries = np.zeros([N,dtCount])   # Acceleration time series. [x/y/z, body index, frame index]
+
+#### State vectors ####
+Pos = np.zeros([3,N])       # Position. [x/y/z, body index]
+Vel = np.zeros([3,N])       # Velocity. [x/y/z, body index]
+Acc = np.zeros([3,N])       # Acceleration. [x/y/z, body index]
+AbsAcc = np.zeros(N)        # Acceleration magnitude. [body index]
+PosList = np.array([])      # All possible positions for bodies, in a mesh shaped in a box surrounding each galaxy's "cylinder".
+Abs_r = np.array([])        # Distance of each of the above positions from the structure's centre.
+iChosen = np.array([])      # Indices in PosList of all possible positions that let a distance smaller than a desired radius.
+VertSpeed = 1500            # Vertical initial speeds of all bodies (hence galaxies).
+
+#### Galaxy initial physical parameters ####
+BottomGalaxyCentre = np.array([3.5*LenUnit,3.5*LenUnit,0.25*LenUnit])   # Centre of bottom galaxy.
+GalaxyThickness = 0.25*LenUnit      # Full thickness of each cylinderical-like structure in a galaxy.
+GalaxyRad = 1.5*LenUnit             # Radius of a galaxy.
+CoreRad = 0.5*LenUnit               # Radius of a galaxy's core.
+VertGalDistance = 1.5*LenUnit       # Vertical distance between galaxy centres.
+HorizGalDistance = 1*LenUnit        # Horizontal distance between galaxy centres.
+MeshInt = 10                        # Body generation mesh interval. Unit distance. Allows to save PosList's memory take-up.
+N_AddedToCore = 1/3 * N             # Number of bodies generated in the core, being in it along with those generated in the larger cylinder.
+InvertRotation = True               # Whether to invert the top galaxy's rotation.
+
+#-------------------------------
+#---------- FUNCTIONS ----------
+#-------------------------------
+
+#### Place n bodies in region with given radius and centre ####
+def placeInRegion(Num,Centre,Radius,IsShifted):
+    global PosList,Abs_r,iChosen,Pos
+    PosList = MeshInt * mgrid[int((Centre[0]-Radius)/MeshInt):int((Centre[0]+Radius)/MeshInt) , int((Centre[1]-Radius)/MeshInt):int((Centre[1]+Radius)/MeshInt) , int((Centre[2]-0.5*GalaxyThickness)/MeshInt):int((Centre[2]+0.5*GalaxyThickness)/MeshInt)].reshape(3,-1).transpose()  # Create PosList - explained above.
+    if IsShifted:   # The input IsShifted is set to True if we want to shift the mesh positions by half an interval, to prevent overlapping. That is when we place the galaxy's "core" inside the outer cylinder.
+        PosList = np.add(int(MeshInt/2)*np.ones([len(PosList[:,0]),3]),PosList)     # Shift mesh positions by half an interval in each axis.
+    Abs_r = np.linalg.norm(np.subtract(Centre,PosList[:]),axis=1)                           # Distance of position in PosList from the entered centre.
+    iChosen = np.array(random.sample(np.where(Abs_r <= Radius)[0].tolist() , k=int(Num)))   # Indices of positions that are within an entered radius from centre.
+    FirstZero = np.intersect1d(np.where(Pos[0,:]==0),np.intersect1d(np.where(Pos[1,:]==0),np.where(Pos[2,:]==0)))[0]    # Index of first (0,0,0) (still empty) element in Pos.
+    Pos[:,FirstZero:FirstZero+len(iChosen)] = PosList[iChosen].transpose().astype("float64")                            # Insert positions that are within the radius, into Pos on top of empty elements.
+
+
+#### Initialise positions and velocities ####
+def initialiseStates():
+    global PosList,Abs_r,iChosen,Pos,Vel
+    TopGalaxyCentre = np.add(BottomGalaxyCentre,np.array([HorizGalDistance,0,VertGalDistance])) # Centre of top galaxy, given distance between the centres.
+    #### Positions ####
+    placeInRegion((N-N_AddedToCore)/2,BottomGalaxyCentre,GalaxyRad,False)   # Place bodies in   outer region,   bottom galaxy.
+    placeInRegion((N_AddedToCore)/2,BottomGalaxyCentre,CoreRad,True)        # Place bodies in   core,           bottom galaxy.
+    placeInRegion((N-N_AddedToCore)/2,TopGalaxyCentre,GalaxyRad,False)      # Place bodies in   outer region,   top galaxy.
+    placeInRegion((N_AddedToCore)/2,TopGalaxyCentre,CoreRad,True)           # Place bodies in   core,           top galaxy.
+    #### Velocities ####
+    r = np.zeros([3,N])     # This will be a vector of the difference between positions and the centre.
+    r[:,:int(N/2)] = np.subtract(BottomGalaxyCentre,Pos[:,:int(N/2)].transpose()).transpose()   # First half of it - get r of bottom galaxy.
+    r[:,int(N/2):] = np.subtract(TopGalaxyCentre,Pos[:,int(N/2):].transpose()).transpose()      # Second half of it - get r of top galaxy.
+    Abs_r = np.linalg.norm(r,axis=0)        # |r|
+    # Below: Body velocity. Using the distribution that performed best by trial and error and its parameters.
+    # V(|r|) = 880 |r|^0.4 * (r - |r|(1,1,1))x(0,0,1)       - produces tangential motion of the galaxy's bodies.
+    Vel = 880 * (Abs_r**0.4) * np.cross(np.divide(r,np.array([Abs_r,Abs_r,Abs_r])),np.array([0,0,1]),axis=0)
+    Vel[2,:] = np.zeros(N)                  # Eliminate z values, to make it initially a moving disk.
+    if InvertRotation:
+        Vel[:,int(N/2):] = -Vel[:,int(N/2):]    # Invert top galaxy's rotation.
+    Vel[2,:int(N/2)] = VertSpeed * np.ones(int(N/2))    # Move bottom galaxy upwards on VertSpeed.
+    Vel[2,int(N/2):] = -VertSpeed * np.ones(int(N/2))   # Move top galaxy downwards on VertSpeed.
+    
+
+#### Find acceleration of body i, for the current step ####
+def findCurrentAcc(i):
+    j = list(range(0,i))+list(range(i+1,N-1))   # List of indices of all other bodies.
+    Sum_r_Abs_r3 = np.zeros(3)                  # Sum of all r/|r|^3. [x/y/z]
+    r = np.subtract(Pos[:,j],Pos[:,i*np.ones(len(j),dtype=int)])    # Position difference vector. [x/y/z, index in list j]
+    Abs_r3 = np.linalg.norm(r,axis=0)**3        # |r|^3. [index in list j]
+    NonTouching_jIndices = np.where(Abs_r3 >= Diam**3)[0]   # Indices in list j, of bodies that don't touch i (|r| >= Diam).
+    Sum_r_Abs_r3 = np.sum(np.divide(r[:,NonTouching_jIndices],0.001*Abs_r3[NonTouching_jIndices]),axis=1)   # Summing all r/|r|^3 of bodies that don't touch i.
+    Acc[:,i] = Gm * Sum_r_Abs_r3 * 0.001        # Acceleration of body i, given the r/|r|^3 sum.
+
+
+#### Find velocity of body i for the next timestep ####
+def findNextVel(i):
+    Vel[:,i] += Acc[:,i]*dt
+
+
+#### Find position of body i for the next timestep ####
+# This uses the velocity of the CURRENT timestep, found by the previous iteration of findNextVel(i).
+def findNextPos(i):
+    Pos[:,i] += Vel[:,i]*dt + 0.5*Acc[:,i]*(dt**2)
+
+
+#### Run simulation, create time series [x/y/z,body,timestep] ####
+def Run(dtCount):                   # Done given a frame count.
+    print("Initial states set. Starting to run.")
+    for t in range(dtCount-1):      # For each timestep.
+        for i in range(N-1):        # For each body i.
+            findCurrentAcc(i)       # Find current acceleration components.
+            findNextPos(i)          # Find next position.
+            findNextVel(i)          # Find next velocity components.
+        TimeSeries[:,:,t] = Pos[:,:]    # Insert positions [x/y/z,body] for each timestep.
+        AccTimeSeries[:,t] = np.linalg.norm(Acc,axis=0)     # Insert acceleration magnitudes [body] for each timestep.
+        print(" ",(t+1),"of",dtCount,"frames loaded.",end="\r")     # Display number of loaded frames, real-time.
+
+
+#### Form a scatter, displaying a frame in the time-series given timestep t.
+def Update(t):
+    ax.clear()
+    ax.grid(False)      # No grid.
+    ax.set_xticks([])   # No ticks.
+    ax.set_yticks([])
+    ax.set_zticks([])
+    #
+    ax.w_xaxis.line.set_color((1.0, 1.0, 1.0, 0.0))     # No axes.
+    ax.w_yaxis.line.set_color((1.0, 1.0, 1.0, 0.0))
+    ax.w_zaxis.line.set_color((1.0, 1.0, 1.0, 0.0))
+    ax.w_xaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))     # No panes.
+    ax.w_yaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+    ax.w_zaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+    #
+    ax.set_xlim3d(1.5*LenUnit,5.5*LenUnit)              # Axes limits using LenUnit.
+    ax.set_ylim3d(1.5*LenUnit,5.5*LenUnit)
+    ax.set_zlim3d(-0.5*LenUnit,3.75*LenUnit)
+    # Below: Display time series scatter. Color a point according to its acceleration magnitude relative to others'.
+    ax.scatter(TimeSeries[0,1:N-1,t],TimeSeries[1,1:N-1,t],TimeSeries[2,1:N-1,t],s=4,c=AccTimeSeries[1:N-1,t],cmap="coolwarm")
+
+
+#### Save created simulation ####
+# Parameter "name" holds the name (or adress with name, otherwise appears in user folder)
+def saveNewSim(name):
+    np.savetxt(name+"X_2Streams.txt",TimeSeries[0,:,:])     # Save time series x values in txt file.
+    np.savetxt(name+"Y_2Streams.txt",TimeSeries[1,:,:])     # Save time series y values in txt file.
+    np.savetxt(name+"Z_2Streams.txt",TimeSeries[2,:,:])     # Save time series z values in txt file.
+    np.savetxt(name+"_Acc_2Streams.txt",AccTimeSeries[:,:])     # Save acceleration time series in txt file.
+    np.savetxt(name+"_Props_2Streams.txt",np.array([N,dtCount,LenUnit]))    # Save properties (N,dtCount,LenUnit) in txt file.
+
+
+#### Load saved time series ####
+def loadSavedSim(name):
+    n,dtcount,lenunit = np.loadtxt(name+"_Props_2Streams.txt").astype(int)
+    TimeSeries = np.zeros([3,n,dtcount])
+    TimeSeries[0,:,:] = np.loadtxt(name+"X_2Streams.txt")
+    TimeSeries[1,:,:] = np.loadtxt(name+"Y_2Streams.txt")
+    TimeSeries[2,:,:] = np.loadtxt(name+"Z_2Streams.txt")
+    AccTimeSeries = np.loadtxt(name+"_Acc_2Streams.txt")
+    def Update(t):
+        ax.clear()
+        ax.grid(False)      # No grid.
+        ax.set_xticks([])   # No ticks.
+        ax.set_yticks([])
+        ax.set_zticks([])
+        #
+        ax.w_xaxis.line.set_color((1.0, 1.0, 1.0, 0.0))     # No axes.
+        ax.w_yaxis.line.set_color((1.0, 1.0, 1.0, 0.0))
+        ax.w_zaxis.line.set_color((1.0, 1.0, 1.0, 0.0))
+        ax.w_xaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))     # No panes.
+        ax.w_yaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+        ax.w_zaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+        #
+        ax.set_xlim3d(1.5*lenunit,5.5*lenunit)              # Axes limits using LenUnit.
+        ax.set_ylim3d(1.5*lenunit,5.5*lenunit)
+        ax.set_zlim3d(-0.5*lenunit,3.75*lenunit)
+        # Display time series scatter. Color points according to acceleration magnitude.
+        ax.scatter(TimeSeries[0,1:N-1,t],TimeSeries[1,1:N-1,t],TimeSeries[2,1:N-1,t],s=8,c=AccTimeSeries[1:N-1,t],cmap="coolwarm")
+    A = anim.FuncAnimation(fig,Update,interval=40)          # Animate scatters in time interval 40ms (25 fps. Can be any interval. 17 yields ~60 fps).
+    mplot.show()
+
+
+fig = mplot.figure()
+mplot.style.use('dark_background')
+ax = Axes3D(fig)
+
+
+#--------------------------
+#---------- MAIN ----------
+#--------------------------
+
+def Main():
+    print("New simulation - '1'")
+    print("Load saved simulation - '2'")
+    Input = input()
+    if (Input == "1"):          # "New simulation" mode.
+        initialiseStates()      # Initialise states.
+        Run(dtCount)            # Form time series.
+        Scatter = ax.scatter(0,0,0)
+        A = anim.FuncAnimation(fig,Update,interval=5)  # Animate and show.
+        mplot.show()
+        print("Save new simulation - '1'")  # After closing the figure window - option to save.
+        Input = input()
+        if (Input == "1"):              # If choosing option.
+            Input = input("Name: ")     # Input name. Save time series by that name.
+            saveNewSim(Input)
+    if (Input == "2"):          # "Load saved" option.
+        name = input("Name: ")  # Name.
+        loadSavedSim(name)      # Load saved time series.
+
+Main()
